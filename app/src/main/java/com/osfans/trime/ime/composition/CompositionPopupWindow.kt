@@ -4,7 +4,6 @@
 
 package com.osfans.trime.ime.composition
 
-import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.RectF
 import android.os.Build
@@ -35,6 +34,8 @@ import splitties.views.dsl.core.add
 import splitties.views.dsl.core.horizontalLayout
 import splitties.views.dsl.core.lParams
 import splitties.views.dsl.core.wrapContent
+import splitties.views.horizontalPadding
+import splitties.views.verticalPadding
 import timber.log.Timber
 
 @InputScope
@@ -62,10 +63,12 @@ class CompositionPopupWindow(
             setKeyboardActionListener(commonKeyboardActionListener.listener)
         }
 
-    val root =
+    private val root =
         ctx.horizontalLayout {
             layoutParams = ViewGroup.LayoutParams(wrapContent, wrapContent)
             visibility = if (isPopupWindowEnabled) View.VISIBLE else View.GONE
+            horizontalPadding = dp(theme.generalStyle.layout.marginX)
+            verticalPadding = dp(theme.generalStyle.layout.marginY)
             add(composition, lParams(wrapContent, wrapContent))
         }
 
@@ -84,7 +87,7 @@ class CompositionPopupWindow(
     // 悬浮窗口彈出位置
     private var popupWindowPos = PopupPosition.fromString(theme.generalStyle.layout.position)
 
-    private val mPopupWindow =
+    private val mPopupWindow by lazy {
         PopupWindow(root).apply {
             isClippingEnabled = false
             inputMethodMode = PopupWindow.INPUT_METHOD_NOT_NEEDED
@@ -102,25 +105,20 @@ class CompositionPopupWindow(
                     theme.generalStyle.layout.alpha,
                 ),
             )
+            width = ViewGroup.LayoutParams.WRAP_CONTENT
+            height = ViewGroup.LayoutParams.WRAP_CONTENT
             elevation =
                 ctx.dp(
                     theme.generalStyle.layout.elevation
                         .toFloat(),
                 )
         }
+    }
 
     var isCursorUpdated = false // 光標是否移動
 
     private val mPopupRectF = RectF()
     private val mPopupHandler = Handler(Looper.getMainLooper())
-
-    // TODO: Don't access internal resource like this
-    private val statusBarHeight: Int
-        @SuppressLint("InternalInsetResource", "DiscouragedApi")
-        get() {
-            val id = ctx.resources.getIdentifier("status_bar_height", "dimen", "android")
-            return ctx.resources.getDimensionPixelSize(id)
-        }
 
     private val mPopupTimer =
         Runnable {
@@ -128,13 +126,18 @@ class CompositionPopupWindow(
             bar.view.let { anchor ->
                 var x = 0
                 var y = 0
-                val candidateLocation = IntArray(2)
-                anchor.getLocationOnScreen(candidateLocation)
+                val (_, anchorY) =
+                    intArrayOf(0, 0).also {
+                        anchor.getLocationInWindow(it)
+                    }
+                root.measure(View.MeasureSpec.UNSPECIFIED, View.MeasureSpec.UNSPECIFIED)
+                val selfWidth = root.measuredWidth
+                val selfHeight = root.measuredHeight
 
-                val minX: Int = anchor.dp(popupMarginH)
-                val minY: Int = anchor.dp(popupMargin)
-                val maxX: Int = anchor.width - mPopupWindow.width - minX
-                val maxY = candidateLocation[1] - mPopupWindow.height - minY
+                val minX = anchor.dp(popupMarginH)
+                val minY = anchor.dp(popupMargin)
+                val maxX = anchor.width - selfWidth - minX
+                val maxY = anchorY - selfHeight - minY
                 if (isWinFixed() || !isCursorUpdated) {
                     // setCandidatesViewShown(true);
                     when (popupWindowPos) {
@@ -175,18 +178,17 @@ class CompositionPopupWindow(
                         PopupPosition.LEFT, PopupPosition.RIGHT ->
                             y = mPopupRectF.bottom.toInt() + popupMargin
                         PopupPosition.LEFT_UP, PopupPosition.RIGHT_UP ->
-                            y = mPopupRectF.top.toInt() - mPopupWindow.height - popupMargin
+                            y = mPopupRectF.top.toInt() - selfHeight - popupMargin
                         else -> Timber.wtf("UNREACHABLE BRANCH")
                     }
                     y = MathUtils.clamp(y, minY, maxY)
                 }
-                y -= statusBarHeight
                 if (!mPopupWindow.isShowing) {
                     mPopupWindow.showAtLocation(anchor, Gravity.START or Gravity.TOP, x, y)
                 } else {
                     /* must use the width and height of popup window itself here directly,
                      * otherwise the width and height cannot be updated! */
-                    mPopupWindow.update(x, y, mPopupWindow.width, mPopupWindow.height)
+                    mPopupWindow.update(x, y, -1, -1)
                 }
             }
         }
@@ -226,12 +228,6 @@ class CompositionPopupWindow(
         if (isPopupWindowMovable == "once") {
             popupWindowPos = PopupPosition.fromString(theme.generalStyle.layout.position)
         }
-        root.measure(
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-        )
-        mPopupWindow.width = root.measuredWidth
-        mPopupWindow.height = root.measuredHeight
         mPopupHandler.post(mPopupTimer)
     }
 

@@ -4,12 +4,11 @@
 
 @file:Suppress("UnstableApiUsage")
 
-import org.gradle.configurationcache.extensions.capitalized
-
 plugins {
     id("com.osfans.trime.native-app-convention")
     id("com.osfans.trime.data-checksums")
     id("com.osfans.trime.native-cache-hash")
+    id("com.osfans.trime.opencc-data")
     alias(libs.plugins.aboutlibraries)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.serialization)
@@ -109,7 +108,7 @@ ksp {
 }
 
 android.applicationVariants.all {
-    val variantName = name.capitalized()
+    val variantName = name.replaceFirstChar { it.uppercase() }
     tasks.findByName("generateDataChecksums")?.also {
         tasks.getByName("merge${variantName}Assets").dependsOn(it)
     }

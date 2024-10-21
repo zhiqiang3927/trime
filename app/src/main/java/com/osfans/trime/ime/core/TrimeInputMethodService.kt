@@ -32,14 +32,16 @@ import androidx.core.view.updateLayoutParams
 import androidx.lifecycle.lifecycleScope
 import com.osfans.trime.BuildConfig
 import com.osfans.trime.R
+import com.osfans.trime.core.KeyModifier
 import com.osfans.trime.core.KeyModifiers
 import com.osfans.trime.core.KeyValue
 import com.osfans.trime.core.Rime
 import com.osfans.trime.core.RimeApi
+import com.osfans.trime.core.RimeCallback
+import com.osfans.trime.core.RimeEvent
 import com.osfans.trime.core.RimeKeyMapping
 import com.osfans.trime.core.RimeNotification
 import com.osfans.trime.core.RimeProto
-import com.osfans.trime.core.RimeResponse
 import com.osfans.trime.daemon.RimeDaemon
 import com.osfans.trime.daemon.RimeSession
 import com.osfans.trime.data.db.DraftHelper
@@ -205,13 +207,8 @@ open class TrimeInputMethodService : LifecycleInputMethodService() {
             jobs.consumeEach { it.join() }
         }
         lifecycleScope.launch {
-            rime.run { notificationFlow }.collect {
-                handleRimeNotification(it)
-            }
-        }
-        lifecycleScope.launch {
-            rime.run { responseFlow }.collect {
-                handleRimeResponse(it)
+            rime.run { callbackFlow }.collect {
+                handleRimeCallback(it)
             }
         }
         ThemeManager.addOnChangedListener(onThemeChangeListener)
@@ -257,44 +254,67 @@ open class TrimeInputMethodService : LifecycleInputMethodService() {
         }
     }
 
-    private fun handleRimeNotification(notification: RimeNotification<*>) {
-        if (notification is RimeNotification.SchemaNotification) {
-            recreateInputView(ThemeManager.activeTheme)
-        } else if (notification is RimeNotification.OptionNotification) {
-            val value = notification.value.value
-            when (val option = notification.value.option) {
-                "ascii_mode" -> {
-                    InputFeedbackManager.ttsLanguage =
-                        locales[if (value) 1 else 0]
-                }
-                "_hide_bar",
-                "_hide_candidate",
-                -> {
-                    setCandidatesViewShown(isComposable && !value)
-                }
-                else ->
-                    if (option.startsWith("_key_") && option.length > 5 && value) {
-                        shouldUpdateRimeOption = false // 防止在 handleRimeNotification 中 setOption
-                        val key = option.substring(5)
-                        inputView
-                            ?.commonKeyboardActionListener
-                            ?.listener
-                            ?.onEvent(EventManager.getEvent(key))
-                        shouldUpdateRimeOption = true
-                    }
+    private fun handleRimeCallback(it: RimeCallback) {
+        when (it) {
+            is RimeNotification.SchemaNotification -> {
+                recreateInputView(ThemeManager.activeTheme)
             }
-        }
-    }
 
-    private fun handleRimeResponse(response: RimeResponse) {
-        val (commit, ctx, _) = response
-        if (commit != null && !commit.text.isNullOrEmpty()) {
-            commitText(commit.text)
+            is RimeNotification.OptionNotification -> {
+                val value = it.value.value
+                when (val option = it.value.option) {
+                    "ascii_mode" -> {
+                        InputFeedbackManager.ttsLanguage =
+                            locales[if (value) 1 else 0]
+                    }
+                    "_hide_bar",
+                    "_hide_candidate",
+                    -> {
+                        setCandidatesViewShown(isComposable && !value)
+                    }
+                    else ->
+                        if (option.startsWith("_key_") && option.length > 5 && value) {
+                            shouldUpdateRimeOption = false // 防止在 handleRimeNotification 中 setOption
+                            val key = option.substring(5)
+                            inputView
+                                ?.commonKeyboardActionListener
+                                ?.listener
+                                ?.onEvent(EventManager.getEvent(key))
+                            shouldUpdateRimeOption = true
+                        }
+                }
+            }
+            is RimeEvent.IpcResponseEvent ->
+                it.data.let event@{
+                    val (commit, ctx) = it
+                    if (commit?.text?.isNotEmpty() == true) {
+                        commitText(commit.text)
+                    }
+                    if (ctx != null) {
+                        updateComposingText(ctx)
+                    }
+                    updateComposing()
+                }
+            is RimeEvent.KeyEvent ->
+                it.data.let event@{
+                    val keyCode = it.value.keyCode
+                    if (keyCode != KeyEvent.KEYCODE_UNKNOWN) {
+                        val eventTime = SystemClock.uptimeMillis()
+                        if (it.modifiers.modifiers == KeyModifier.Release.modifier) {
+                            sendUpKeyEvent(eventTime, keyCode, it.modifiers.metaState)
+                        } else {
+                            sendDownKeyEvent(eventTime, keyCode, it.modifiers.metaState)
+                        }
+                    } else {
+                        if (it.modifiers.modifiers != KeyModifier.Release.modifier && it.value.value > 0) {
+                            commitText(Char(it.value.value).toString())
+                        } else {
+                            Timber.w("Unhandled Rime KeyEvent: $it")
+                        }
+                    }
+                }
+            else -> {}
         }
-        if (ctx != null) {
-            updateComposingText(ctx)
-        }
-        updateComposing()
     }
 
     fun pasteByChar() {
@@ -768,6 +788,13 @@ open class TrimeInputMethodService : LifecycleInputMethodService() {
 
     private fun forwardKeyEvent(event: KeyEvent): Boolean {
         val modifiers = KeyModifiers.fromKeyEvent(event)
+        val charCode = event.unicodeChar
+        if (charCode > 0 && charCode != '\t'.code) {
+            postRimeJob {
+                processKey(charCode, modifiers.modifiers)
+            }
+            return true
+        }
         val keyVal = KeyValue.fromKeyEvent(event)
         if (keyVal.value != RimeKeyMapping.RimeKey_VoidSymbol) {
             postRimeJob {
@@ -833,10 +860,9 @@ open class TrimeInputMethodService : LifecycleInputMethodService() {
             )
         } else if (hookKeyboard(keyEventCode, metaState)) {
             Timber.d("\t<TrimeInput>\thandleKey()\thookKeyboard, keycode=%d", keyEventCode)
-        } else if (performEnter(keyEventCode) || handleBack(keyEventCode)) {
-            // 处理返回键（隐藏软键盘）和回车键（换行）
-            // todo 确认是否有必要单独处理回车键？是否需要把back和escape全部占用？
-            Timber.d("\t<TrimeInput>\thandleKey()\tEnterOrHide, keycode=%d", keyEventCode)
+        } else if (handleBack(keyEventCode)) {
+            // 处理返回键（隐藏软键盘）
+            Timber.d("handleKey(): Back, keycode=$keyEventCode")
         } else if (openCategory(keyEventCode)) {
             // 打开系统默认应用
             Timber.d("\t<TrimeInput>\thandleKey()\topenCategory keycode=%d", keyEventCode)

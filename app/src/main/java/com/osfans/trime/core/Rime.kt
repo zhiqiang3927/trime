@@ -28,8 +28,8 @@ class Rime :
     private val lifecycleImpl = RimeLifecycleImpl()
     override val lifecycle get() = lifecycleImpl
 
-    override val notificationFlow = notificationFlow_.asSharedFlow()
-    override val responseFlow = responseFlow_.asSharedFlow()
+    override val callbackFlow = callbackFlow_.asSharedFlow()
+
     override val stateFlow get() = lifecycle.currentStateFlow
 
     override val isReady: Boolean
@@ -54,7 +54,7 @@ class Rime :
 
                     lifecycleImpl.emitState(RimeLifecycle.State.READY)
 
-                    requestRimeResponse()
+                    ipcResponseCallback()
                     SchemaManager.init(getCurrentRimeSchema())
                 }
 
@@ -79,7 +79,13 @@ class Rime :
         modifiers: UInt,
     ): Boolean =
         withRimeContext {
-            processRimeKey(value, modifiers.toInt()).also { if (it) requestRimeResponse() }
+            processRimeKey(value, modifiers.toInt()).also {
+                if (it) {
+                    ipcResponseCallback()
+                } else {
+                    keyEventCallback(KeyValue(value), KeyModifiers(modifiers))
+                }
+            }
         }
 
     override suspend fun processKey(
@@ -87,17 +93,23 @@ class Rime :
         modifiers: KeyModifiers,
     ): Boolean =
         withRimeContext {
-            processRimeKey(value.value, modifiers.toInt()).also { if (it) requestRimeResponse() }
+            processRimeKey(value.value, modifiers.toInt()).also {
+                if (it) {
+                    ipcResponseCallback()
+                } else {
+                    keyEventCallback(value, modifiers)
+                }
+            }
         }
 
     override suspend fun selectCandidate(idx: Int): Boolean =
         withRimeContext {
-            selectRimeCandidate(idx).also { if (it) requestRimeResponse() }
+            selectRimeCandidate(idx).also { if (it) ipcResponseCallback() }
         }
 
     override suspend fun forgetCandidate(idx: Int): Boolean =
         withRimeContext {
-            forgetRimeCandidate(idx).also { if (it) requestRimeResponse() }
+            forgetRimeCandidate(idx).also { if (it) ipcResponseCallback() }
         }
 
     override suspend fun availableSchemata(): Array<SchemaItem> = withRimeContext { getAvailableRimeSchemaList() }
@@ -118,12 +130,12 @@ class Rime :
             schema ?: schemaItemCached
         }
 
-    override suspend fun commitComposition(): Boolean = withRimeContext { commitRimeComposition().also { if (it) requestRimeResponse() } }
+    override suspend fun commitComposition(): Boolean = withRimeContext { commitRimeComposition().also { if (it) ipcResponseCallback() } }
 
     override suspend fun clearComposition() =
         withRimeContext {
             clearRimeComposition()
-            requestRimeResponse()
+            ipcResponseCallback()
         }
 
     override suspend fun setRuntimeOption(
@@ -147,7 +159,7 @@ class Rime :
             getRimeCandidates(startIndex, limit) ?: emptyArray()
         }
 
-    private fun handleRimeNotification(it: RimeNotification<*>) {
+    private fun handleRimeCallback(it: RimeCallback) {
         when (it) {
             is RimeNotification.SchemaNotification -> {
                 schemaItemCached = it.value
@@ -165,22 +177,22 @@ class Rime :
                     "start" -> OpenCCDictManager.buildOpenCCDict()
                 }
             }
+            is RimeEvent.IpcResponseEvent ->
+                it.data.let event@{ data ->
+                    data.status?.let {
+                        val status = InputStatus.fromStatus(it)
+                        inputStatusCached = status
+                        inputStatus = it // for compatibility
+
+                        val item = SchemaItem.fromStatus(it)
+                        if (item != schemaItemCached) {
+                            schemaItemCached = item
+                        }
+                    }
+                    data.context?.let { inputContext = it } // for compatibility
+                }
             else -> {}
         }
-    }
-
-    private fun handleRimeResponse(response: RimeResponse) {
-        response.status?.let {
-            val status = InputStatus.fromStatus(it)
-            inputStatusCached = status
-            inputStatus = it // for compatibility
-
-            val item = SchemaItem.fromStatus(it)
-            if (item != schemaItemCached) {
-                schemaItemCached = item
-            }
-        }
-        response.context?.let { inputContext = it } // for compatibility
     }
 
     fun startup(fullCheck: Boolean) {
@@ -189,8 +201,7 @@ class Rime :
             return
         }
         if (appContext.isStorageAvailable()) {
-            registerRimeNotificationHandler(::handleRimeNotification)
-            registerRimeResponseHandler(::handleRimeResponse)
+            registerRimeCallbackHandler(::handleRimeCallback)
             lifecycleImpl.emitState(RimeLifecycle.State.STARTING)
             dispatcher.start(fullCheck)
         }
@@ -209,28 +220,19 @@ class Rime :
             }
         }
         lifecycleImpl.emitState(RimeLifecycle.State.STOPPED)
-        unregisterRimeNotificationHandler(::handleRimeNotification)
-        unregisterRimeResponseHandler(::handleRimeResponse)
+        unregisterRimeCallbackHandler(::handleRimeCallback)
     }
 
     companion object {
         private var inputContext: RimeProto.Context? = null
         private var inputStatus: RimeProto.Status? = null
-        private val notificationFlow_ =
-            MutableSharedFlow<RimeNotification<*>>(
+        private val callbackFlow_ =
+            MutableSharedFlow<RimeCallback>(
                 extraBufferCapacity = 15,
                 onBufferOverflow = BufferOverflow.DROP_OLDEST,
             )
 
-        private val responseFlow_ =
-            MutableSharedFlow<RimeResponse>(
-                extraBufferCapacity = 15,
-                onBufferOverflow = BufferOverflow.DROP_LATEST,
-            )
-
-        private val notificationHandlers = ArrayList<(RimeNotification<*>) -> Unit>()
-
-        private val responseHandlers = ArrayList<(RimeResponse) -> Unit>()
+        private val callbackHandlers = ArrayList<(RimeCallback) -> Unit>()
 
         init {
             System.loadLibrary("rime_jni")
@@ -297,7 +299,11 @@ class Rime :
             Timber.d("processKey: keyCode=$keycode, mask=$mask")
             return processRimeKey(keycode, mask).also {
                 Timber.d("processKey ${if (it) "success" else "failed"}")
-                if (it) requestRimeResponse()
+                if (it) {
+                    ipcResponseCallback()
+                } else {
+                    keyEventCallback(KeyValue(keycode), KeyModifiers.of(mask))
+                }
             }
         }
 
@@ -309,7 +315,7 @@ class Rime :
                 sequence.toString().replace("{}", "{braceleft}{braceright}"),
             ).also {
                 Timber.d("simulateKeySequence ${if (it) "success" else "failed"}")
-                if (it) requestRimeResponse()
+                if (it) ipcResponseCallback()
             }
         }
 
@@ -329,7 +335,7 @@ class Rime :
         @JvmStatic
         fun setCaretPos(caretPos: Int) {
             setRimeCaretPos(caretPos)
-            requestRimeResponse()
+            ipcResponseCallback()
         }
 
         // init
@@ -489,33 +495,41 @@ class Rime :
         ) {
             val notification = RimeNotification.create(messageType, messageValue)
             Timber.d("Handling Rime notification: $notification")
-            notificationHandlers.forEach { it.invoke(notification) }
-            notificationFlow_.tryEmit(notification)
+            callbackHandlers.forEach { it.invoke(notification) }
+            callbackFlow_.tryEmit(notification)
         }
 
-        private fun registerRimeNotificationHandler(handler: (RimeNotification<*>) -> Unit) {
-            if (notificationHandlers.contains(handler)) return
-            notificationHandlers.add(handler)
+        private fun ipcResponseCallback() {
+            handleRimeEvent(
+                RimeEvent.EventType.IpcResponse,
+                RimeEvent.IpcResponseEvent.Data(getRimeCommit(), getRimeContext(), getRimeStatus()),
+            )
         }
 
-        private fun unregisterRimeNotificationHandler(handler: (RimeNotification<*>) -> Unit) {
-            notificationHandlers.remove(handler)
+        private fun keyEventCallback(
+            value: KeyValue,
+            modifiers: KeyModifiers,
+        ) {
+            handleRimeEvent(RimeEvent.EventType.Key, RimeEvent.KeyEvent.Data(value, modifiers))
         }
 
-        fun requestRimeResponse() {
-            val response = RimeResponse(getRimeCommit(), getRimeContext(), getRimeStatus())
-            Timber.d("Got Rime response: $response")
-            responseHandlers.forEach { it.invoke(response) }
-            responseFlow_.tryEmit(response)
+        private fun <T> handleRimeEvent(
+            type: RimeEvent.EventType,
+            data: T,
+        ) {
+            val event = RimeEvent.create(type, data)
+            Timber.d("Handling $event")
+            callbackHandlers.forEach { it.invoke(event) }
+            callbackFlow_.tryEmit(event)
         }
 
-        private fun registerRimeResponseHandler(handler: (RimeResponse) -> Unit) {
-            if (responseHandlers.contains(handler)) return
-            responseHandlers.add(handler)
+        private fun registerRimeCallbackHandler(handler: (RimeCallback) -> Unit) {
+            if (callbackHandlers.contains(handler)) return
+            callbackHandlers.add(handler)
         }
 
-        private fun unregisterRimeResponseHandler(handler: (RimeResponse) -> Unit) {
-            responseHandlers.remove(handler)
+        private fun unregisterRimeCallbackHandler(handler: (RimeCallback) -> Unit) {
+            callbackHandlers.remove(handler)
         }
     }
 }
